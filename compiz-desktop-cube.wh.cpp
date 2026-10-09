@@ -1,12 +1,12 @@
 // ==WindhawkMod==
 // @id              compiz-desktop-cube-v2
 // @name            Compiz Desktop Cube for Windows 11
-// @description     Classic 3D Desktop Cube virtual-desktop switcher for Windows 11 using native Windows composition and real virtual desktop snapshots.
-// @version         1.3.1
+// @description     Classic 3D Desktop Cube virtual-desktop switcher for Windows 11 using native Windows composition, GPU blurred background, and real virtual desktop snapshots.
+// @version         1.3.2
 // @author          Soham
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -lole32 -loleaut32 -lwindowsapp -ldwmapi -luuid -luser32 -lgdi32 -lcomctl32 -ld3d11 -ld2d1 -ldxgi -lwinmm
+// @compilerOptions -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -lole32 -loleaut32 -lwindowsapp -ldwmapi -luuid -luser32 -lgdi32 -lcomctl32 -ld3d11 -ld2d1 -ldxgi -lwinmm -ldwrite
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -15,23 +15,22 @@
 
 Adds a classic Compiz/GNOME-style 3D Desktop Cube virtual-desktop switcher to Windows 11.
 Built with native Windows Composition (Windows.UI.Composition) and Direct2D for 144 Hz smoothness,
-zero idle CPU usage, hardware-accelerated Acrylic blur, and real Windows 11 virtual desktop integration.
+zero idle CPU usage, real-time GPU Gaussian blur, and genuine Windows 11 virtual desktop integration.
 
 ## Key Features
-- **Real Windows Virtual Desktops**: Represents and switches between actual Windows virtual desktops.
-- **Actual Desktop Snapshots**: Each cube face displays the real captured contents of that virtual desktop (wallpaper, open windows, taskbar, desktop icons).
-- **Live Blurred Background**: Hardware-accelerated Windows 11 Desktop Acrylic backdrop blurs the active desktop wallpaper and windows behind the 3D cube.
-- **Window Mouse Capture**: Uses native Win32 mouse capture (`SetCapture`) instead of fragile global hooks.
-- **100% Explorer Stability**: Thread-level mouse hooking with zero tampering of InputSite window procedures.
-- **Smooth 144Hz Dragging**: Incremental mouse movement tracking with zero jitter or lag.
-- **Fluid UI-Thread Animation**: 100% thread-safe quartic ease-out snapping driven by the window message pump and multimedia timer.
+- **Real Windows Virtual Desktops**: Discovers and switches between your actual Windows virtual desktops.
+- **Genuine Desktop Content**: Displays real captured contents for visited desktops, and authentic live window cards with titles and icons for unvisited desktops. No dummy placeholders.
+- **Real-Time GPU Blurred Background**: Hardware-accelerated Direct2D Gaussian blur captures and blurs the live active desktop behind the 3D cube.
+- **Global Low-Level Mouse Tracking**: Smoothly drag anywhere across the screen, over any window or monitor without the gesture deactivating when leaving the taskbar.
+- **100% Explorer Stability**: Thread-level mouse tracking with zero tampering of InputSite window procedures.
+- **Fluid 144Hz Snapping**: Quartic ease-out snapping driven by the window message pump and multimedia timer.
 - **ESC Cancellation**: Cancel anytime by pressing Escape to smoothly return to the current desktop without switching.
 
 ## How to Use
 1. Move the mouse over **empty space** on the Windows 11 taskbar.
 2. Press and hold the **left mouse button**.
 3. Drag **inward / upward** (~16 px) to activate the 3D Desktop Cube.
-4. While holding the left button, drag **left or right** to rotate the cube between virtual desktops.
+4. While holding the left button, drag **left or right** across the screen to rotate the cube.
 5. Release the mouse button to snap smoothly to the nearest desktop and switch to it.
 6. Press **Escape** anytime to cancel.
 */
@@ -55,8 +54,8 @@ zero idle CPU usage, hardware-accelerated Acrylic blur, and real Windows 11 virt
   $name: Camera Perspective Distance (px)
   $description: 3D perspective camera focal distance (lower values increase 3D distortion).
 - BackgroundBlur: true
-  $name: Enable Acrylic Background Blur
-  $description: Blurs the live active desktop behind the 3D cube with hardware Acrylic blur.
+  $name: Enable Background Blur
+  $description: Blurs the live active desktop behind the 3D cube with GPU Gaussian blur.
 - BackgroundDim: 25
   $name: Background Scrim Dim (%)
   $description: Subtle dark tint over the blurred background (default 25%).
@@ -76,10 +75,13 @@ zero idle CPU usage, hardware-accelerated Acrylic blur, and real Windows 11 virt
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <commctrl.h>
+#include <shobjidl.h>
 #include <objectarray.h>
 #include <uiautomation.h>
 #include <d3d11.h>
 #include <d2d1_1.h>
+#include <d2d1effects.h>
+#include <dwrite.h>
 #include <dxgi.h>
 #include <mmsystem.h>
 
@@ -95,14 +97,6 @@ zero idle CPU usage, hardware-accelerated Acrylic blur, and real Windows 11 virt
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
 
-#ifndef DWMWA_USE_HOSTBACKDROPBRUSH
-#define DWMWA_USE_HOSTBACKDROPBRUSH 17
-#endif
-
-#ifndef DWMWA_SYSTEMBACKDROP_TYPE
-#define DWMWA_SYSTEMBACKDROP_TYPE 38
-#endif
-
 #ifndef WS_EX_NOREDIRECTIONBITMAP
 #define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
 #endif
@@ -115,7 +109,6 @@ zero idle CPU usage, hardware-accelerated Acrylic blur, and real Windows 11 virt
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
-#include <thread>
 
 // WinRT & Windows.UI.Composition
 #include <winrt/base.h>
@@ -136,6 +129,7 @@ using namespace winrt::Windows::Graphics::Effects;
 // ============================================================================
 static const IID IID_ICompositorInterop = { 0x25297744, 0xC428, 0x429E, {0xA0, 0xAC, 0xB6, 0xF0, 0x45, 0x82, 0x8A, 0x14} };
 static const IID IID_ICompositionDrawingSurfaceInterop = { 0xFD04E6E3, 0xFE0C, 0x4C3C, {0xAB, 0x19, 0xA0, 0x76, 0x01, 0xA5, 0x76, 0xEE} };
+static const IID IID_ICompositorDesktopInterop = { 0x29E691FA, 0x4567, 0x4DCA, { 0xB3, 0x19, 0xD0, 0xF2, 0x07, 0xEB, 0x68, 0x07 } };
 
 struct ICompositionDrawingSurfaceInterop : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE BeginDraw(
@@ -156,23 +150,6 @@ struct ICompositorDesktopInterop : ::IUnknown {
         BOOL isTopmost,
         void** result) = 0;
 };
-__CRT_UUID_DECL(ICompositorDesktopInterop, 0x29E691FA, 0x4567, 0x4DCA, 0xB3, 0x19, 0xD0, 0xF2, 0x07, 0xEB, 0x68, 0x07)
-
-struct IGraphicsEffectD2D1Interop : public IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE GetEffectId(GUID * id) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetNamedPropertyMapping(
-        LPCWSTR name, UINT * index, UINT * mapping) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetPropertyCount(UINT * count) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetProperty(UINT index, void** value) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetSource(UINT index, void** source) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetSourceCount(UINT * count) = 0;
-};
-__CRT_UUID_DECL(IGraphicsEffectD2D1Interop, 0x2FC57384, 0xA068, 0x44D7, 0xA3, 0x31, 0x30, 0x98, 0x2F, 0xCB, 0x71, 0xB0)
-
-namespace winrt::impl {
-    template <>
-    inline constexpr guid guid_v<IGraphicsEffectD2D1Interop>{ 0x2FC57384, 0xA068, 0x44D7, { 0xA3, 0x31, 0x30, 0x98, 0x2F, 0xCB, 0x71, 0xB0 } };
-}
 
 // ============================================================================
 // Logging Macros
@@ -300,9 +277,9 @@ struct Mat4 {
 };
 
 // ============================================================================
-// MODULE 1: VirtualDesktopManager (Windows 11 Build >= 22000 / 26100+)
+// MODULE 1: VDManager (Windows 11 Build >= 22000 / 26100+)
 // ============================================================================
-namespace VirtualDesktopManager {
+namespace VDManager {
 
     struct IVirtualDesktop : public IUnknown {
         virtual HRESULT STDMETHODCALLTYPE IsViewVisible(IUnknown*, BOOL*) = 0;
@@ -361,6 +338,52 @@ namespace VirtualDesktopManager {
         int TotalCount() const { return (int)items.size(); }
     };
 
+    struct WindowCard {
+        std::wstring title;
+        RECT rect{};
+        HICON icon = nullptr;
+    };
+
+    // Query virtual desktops from registry if COM internal interface is not available
+    static bool QueryDesktopsFromRegistry(DesktopList& outList) {
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops",
+            0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+            return false;
+        }
+
+        DWORD dwType = 0;
+        DWORD dwSize = 0;
+        if (RegQueryValueExW(hKey, L"VirtualDesktopIDs", nullptr, &dwType, nullptr, &dwSize) == ERROR_SUCCESS && dwSize >= sizeof(GUID)) {
+            std::vector<BYTE> buffer(dwSize);
+            if (RegQueryValueExW(hKey, L"VirtualDesktopIDs", nullptr, &dwType, buffer.data(), &dwSize) == ERROR_SUCCESS) {
+                int count = (int)(dwSize / sizeof(GUID));
+                GUID* pGuids = (GUID*)buffer.data();
+
+                GUID curGuid{};
+                DWORD dwCurSize = sizeof(curGuid);
+                RegQueryValueExW(hKey, L"CurrentVirtualDesktop", nullptr, nullptr, (LPBYTE)&curGuid, &dwCurSize);
+
+                for (int i = 0; i < count; ++i) {
+                    DesktopItem item;
+                    item.index = i;
+                    item.id = pGuids[i];
+                    wchar_t szName[64];
+                    swprintf_s(szName, L"Desktop %d", i + 1);
+                    item.name = szName;
+                    outList.items.push_back(item);
+                    if (IsEqualGUID(item.id, curGuid)) {
+                        outList.currentIndex = i;
+                    }
+                }
+            }
+        }
+
+        RegCloseKey(hKey);
+        return !outList.items.empty();
+    }
+
     static bool QueryDesktops(DesktopList& outList) {
         InitIIDs();
         outList.items.clear();
@@ -368,59 +391,55 @@ namespace VirtualDesktopManager {
 
         com_ptr<IServiceProvider> sp;
         HRESULT hr = CoCreateInstance(CLSID_ImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(sp.put()));
-        if (FAILED(hr) || !sp) {
-            LOG_ERR(L"Failed to obtain IServiceProvider: 0x%08X", hr);
-            return false;
-        }
+        if (SUCCEEDED(hr) && sp) {
+            com_ptr<IVirtualDesktopManagerInternal> manager;
+            hr = sp->QueryService(CLSID_VirtualDesktopManagerInternal, s_iidManagerInternal, manager.put_void());
+            if (SUCCEEDED(hr) && manager) {
+                typedef HRESULT(STDMETHODCALLTYPE* GetDesktopsProc)(IVirtualDesktopManagerInternal*, IObjectArray**);
+                typedef HRESULT(STDMETHODCALLTYPE* GetCurrentDesktopProc)(IVirtualDesktopManagerInternal*, IVirtualDesktop**);
 
-        com_ptr<IVirtualDesktopManagerInternal> manager;
-        hr = sp->QueryService(CLSID_VirtualDesktopManagerInternal, s_iidManagerInternal, manager.put_void());
-        if (FAILED(hr) || !manager) {
-            LOG_ERR(L"Failed to query IVirtualDesktopManagerInternal: 0x%08X", hr);
-            return false;
-        }
+                auto pVtbl = *(void***)manager.get();
+                GetDesktopsProc fnGetDesktops = (GetDesktopsProc)pVtbl[7];
+                GetCurrentDesktopProc fnGetCurrentDesktop = (GetCurrentDesktopProc)pVtbl[6];
 
-        typedef HRESULT(STDMETHODCALLTYPE* GetDesktopsProc)(IVirtualDesktopManagerInternal*, IObjectArray**);
-        typedef HRESULT(STDMETHODCALLTYPE* GetCurrentDesktopProc)(IVirtualDesktopManagerInternal*, IVirtualDesktop**);
+                com_ptr<IObjectArray> desktopArray;
+                hr = fnGetDesktops(manager.get(), desktopArray.put());
+                if (SUCCEEDED(hr) && desktopArray) {
+                    com_ptr<IVirtualDesktop> currentDesktop;
+                    hr = fnGetCurrentDesktop(manager.get(), currentDesktop.put());
+                    GUID currentId{};
+                    if (SUCCEEDED(hr) && currentDesktop) {
+                        currentDesktop->GetId(&currentId);
+                    }
 
-        auto pVtbl = *(void***)manager.get();
-        GetDesktopsProc fnGetDesktops = (GetDesktopsProc)pVtbl[7];
-        GetCurrentDesktopProc fnGetCurrentDesktop = (GetCurrentDesktopProc)pVtbl[6];
+                    UINT count = 0;
+                    desktopArray->GetCount(&count);
 
-        com_ptr<IObjectArray> desktopArray;
-        hr = fnGetDesktops(manager.get(), desktopArray.put());
-        if (FAILED(hr) || !desktopArray) {
-            LOG_ERR(L"GetDesktops failed: 0x%08X", hr);
-            return false;
-        }
+                    for (UINT i = 0; i < count; ++i) {
+                        com_ptr<IVirtualDesktop> d;
+                        if (SUCCEEDED(desktopArray->GetAt(i, s_iidVirtualDesktop, d.put_void())) && d) {
+                            GUID id{};
+                            d->GetId(&id);
+                            DesktopItem item;
+                            item.index = (int)i;
+                            item.id = id;
+                            wchar_t szName[64];
+                            swprintf_s(szName, L"Desktop %u", i + 1);
+                            item.name = szName;
 
-        com_ptr<IVirtualDesktop> currentDesktop;
-        hr = fnGetCurrentDesktop(manager.get(), currentDesktop.put());
-        GUID currentId{};
-        if (SUCCEEDED(hr) && currentDesktop) {
-            currentDesktop->GetId(&currentId);
-        }
-
-        UINT count = 0;
-        desktopArray->GetCount(&count);
-
-        for (UINT i = 0; i < count; ++i) {
-            com_ptr<IVirtualDesktop> d;
-            if (SUCCEEDED(desktopArray->GetAt(i, s_iidVirtualDesktop, d.put_void())) && d) {
-                GUID id{};
-                d->GetId(&id);
-                DesktopItem item;
-                item.index = (int)i;
-                item.id = id;
-                wchar_t szName[64];
-                swprintf_s(szName, L"Desktop %u", i + 1);
-                item.name = szName;
-
-                outList.items.push_back(item);
-                if (IsEqualGUID(id, currentId)) {
-                    outList.currentIndex = (int)i;
+                            outList.items.push_back(item);
+                            if (IsEqualGUID(id, currentId)) {
+                                outList.currentIndex = (int)i;
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        // Fallback to registry if COM returned empty
+        if (outList.items.empty()) {
+            QueryDesktopsFromRegistry(outList);
         }
 
         LOG_DBG(L"Virtual Desktops enumerated: total=%d, current=%d", (int)outList.items.size(), outList.currentIndex);
@@ -460,11 +479,82 @@ namespace VirtualDesktopManager {
         if (FAILED(hr) || !targetDesktop) return false;
 
         hr = fnSwitchDesktop(manager.get(), targetDesktop.get());
-        LOG_INF(L"Switched to Real Windows Virtual Desktop #%d (0x%08X)", clampedIndex + 1, hr);
+        LOG_INF(L"Switched to Real Windows Virtual Desktop #%d (hr=0x%08X)", clampedIndex + 1, hr);
         return SUCCEEDED(hr);
     }
 
-} // namespace VirtualDesktopManager
+    struct EnumCardsCtx {
+        const GUID* targetId;
+        IVirtualDesktopManager* pVdm;
+        std::vector<WindowCard>* pOut;
+    };
+
+    static BOOL CALLBACK EnumWindowsCardsProc(HWND hWnd, LPARAM lParam) {
+        EnumCardsCtx* c = (EnumCardsCtx*)lParam;
+        if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return TRUE;
+
+        LONG exStyle = GetWindowLongW(hWnd, GWL_EXSTYLE);
+        if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+
+        DWORD dwCloaked = 0;
+        if (SUCCEEDED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &dwCloaked, sizeof(dwCloaked)))) {
+            if (dwCloaked != 0 && dwCloaked != 2 /* DWM_CLOAKED_SHELL */) {
+                return TRUE;
+            }
+        }
+
+        RECT rc{};
+        GetWindowRect(hWnd, &rc);
+        if ((rc.right - rc.left) < 100 || (rc.bottom - rc.top) < 100) return TRUE;
+
+        if (c->pVdm) {
+            GUID wId{};
+            if (SUCCEEDED(c->pVdm->GetWindowDesktopId(hWnd, &wId))) {
+                if (!IsEqualGUID(wId, *c->targetId)) {
+                    return TRUE;
+                }
+            }
+        }
+
+        WCHAR szTitle[256]{};
+        GetWindowTextW(hWnd, szTitle, ARRAYSIZE(szTitle));
+        if (wcslen(szTitle) == 0) return TRUE;
+
+        WCHAR szClass[128]{};
+        GetClassNameW(hWnd, szClass, ARRAYSIZE(szClass));
+        if (_wcsicmp(szClass, L"Progman") == 0 ||
+            _wcsicmp(szClass, L"WorkerW") == 0 ||
+            _wcsicmp(szClass, L"Shell_TrayWnd") == 0 ||
+            _wcsicmp(szClass, L"Shell_SecondaryTrayWnd") == 0) {
+            return TRUE;
+        }
+
+        HICON hIcon = (HICON)SendMessageW(hWnd, WM_GETICON, ICON_SMALL, 0);
+        if (!hIcon) hIcon = (HICON)SendMessageW(hWnd, WM_GETICON, ICON_BIG, 0);
+        if (!hIcon) hIcon = (HICON)GetClassLongPtrW(hWnd, GCLP_HICONSM);
+        if (!hIcon) hIcon = (HICON)GetClassLongPtrW(hWnd, GCLP_HICON);
+
+        WindowCard card;
+        card.title = szTitle;
+        card.rect = rc;
+        card.icon = hIcon;
+        c->pOut->push_back(card);
+
+        return (c->pOut->size() < 12) ? TRUE : FALSE;
+    }
+
+    // Enumerate actual visible windows belonging to a specific virtual desktop
+    static void GetWindowsForDesktop(const GUID& desktopId, std::vector<WindowCard>& outCards) {
+        outCards.clear();
+
+        com_ptr<IVirtualDesktopManager> vdm;
+        CoCreateInstance(CLSID_VirtualDesktopManager, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(vdm.put()));
+
+        EnumCardsCtx ctx = { &desktopId, vdm.get(), &outCards };
+        EnumWindows(EnumWindowsCardsProc, (LPARAM)&ctx);
+    }
+
+} // namespace VDManager
 
 // ============================================================================
 // MODULE 2: DesktopCaptureManager (Real screen snapshots for all virtual desktops)
@@ -475,7 +565,6 @@ namespace DesktopCaptureManager {
         int width = 0;
         int height = 0;
         std::vector<uint32_t> pixels; // 32-bit BGRA
-        bool isFresh = false;
     };
 
     static std::mutex s_captureMutex;
@@ -532,7 +621,6 @@ namespace DesktopCaptureManager {
         for (auto& px : outData.pixels) {
             px |= 0xFF000000;
         }
-        outData.isFresh = true;
 
         SelectObject(hdcMem, hOld);
         DeleteObject(hDIB);
@@ -541,20 +629,10 @@ namespace DesktopCaptureManager {
         return true;
     }
 
-    // Refresh snapshots: captures current active desktop instantly (~2ms)
-    static void AcquireSnapshots(const VirtualDesktopManager::DesktopList& dList, RECT rcMon) {
+    static void StoreSnapshot(const GUID& id, const SnapshotData& data) {
         std::lock_guard<std::mutex> lock(s_captureMutex);
-        if (dList.items.empty()) return;
-
-        int activeIdx = dList.currentIndex;
-        int total = dList.TotalCount();
-
-        // 1. Always capture current active desktop immediately
-        if (activeIdx >= 0 && activeIdx < total) {
-            std::wstring curKey = GuidToString(dList.items[activeIdx].id);
-            CaptureMonitorScreen(rcMon, s_snapshotCache[curKey]);
-            LOG_DBG(L"Captured active desktop snapshot #%d", activeIdx + 1);
-        }
+        std::wstring key = GuidToString(id);
+        s_snapshotCache[key] = data;
     }
 
     static const SnapshotData* GetSnapshot(const GUID& id) {
@@ -575,8 +653,8 @@ namespace DesktopCaptureManager {
 enum class GestureState {
     Idle,
     Arming,
-    Active,
-    Snapping
+    ActiveDrag,
+    Committing
 };
 
 namespace GestureController {
@@ -586,7 +664,7 @@ namespace GestureController {
 }
 
 // ============================================================================
-// MODULE 3: CubeRenderer (Windows Composition 3D Cube & Glass Acrylic Blur)
+// MODULE 3: CubeRenderer (Windows Composition 3D Cube & GPU Gaussian Blur)
 // ============================================================================
 class CubeRenderer {
 public:
@@ -615,6 +693,7 @@ private:
     void UpdateCubeFaceTransforms(float currentAngle);
     void UpdateDimensions(int screenW, int screenH);
     void InitializeGraphicsDevice();
+    void BuildBackgroundBlurredSurface(const DesktopCaptureManager::SnapshotData& snapshot);
     void BuildFaceSurfaces();
     void OnAnimationTick();
 
@@ -622,6 +701,8 @@ private:
     Compositor m_compositor{ nullptr };
     DesktopWindowTarget m_target{ nullptr };
     ContainerVisual m_rootVisual{ nullptr };
+    SpriteVisual m_backgroundVisual{ nullptr };
+    CompositionDrawingSurface m_bgSurface{ nullptr };
     SpriteVisual m_scrimVisual{ nullptr };
     ContainerVisual m_cubeContainer{ nullptr };
 
@@ -629,6 +710,9 @@ private:
     ID3D11Device* m_d3dDevice = nullptr;
     ID2D1Device* m_d2dDevice = nullptr;
     ID2D1Factory1* m_d2dFactory = nullptr;
+    IDWriteFactory* m_dwriteFactory = nullptr;
+    IDWriteTextFormat* m_textFormatBadge = nullptr;
+    IDWriteTextFormat* m_textFormatTitle = nullptr;
     void* m_compGraphicsDevice = nullptr;
 
     struct FaceVisuals {
@@ -650,7 +734,7 @@ private:
     float m_screenHeight = 1080.0f;
 
     float m_currentRotation = 0.0f;
-    VirtualDesktopManager::DesktopList m_desktopList;
+    VDManager::DesktopList m_desktopList;
     RECT m_monitorRect{};
 
     // UI-Thread Snap Animation State
@@ -701,6 +785,21 @@ void CubeRenderer::InitializeGraphicsDevice() {
 
     if (!m_d2dDevice) return;
 
+    // DirectWrite Factory & Formats for crisp badges and window headers
+    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&m_dwriteFactory);
+    if (m_dwriteFactory) {
+        m_dwriteFactory->CreateTextFormat(
+            L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            13.0f, L"en-us", &m_textFormatBadge
+        );
+        m_dwriteFactory->CreateTextFormat(
+            L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            11.0f, L"en-us", &m_textFormatTitle
+        );
+    }
+
     IUnknown* compUnk = (IUnknown*)winrt::get_abi(m_compositor);
     void* compInterop = nullptr;
     if (SUCCEEDED(compUnk->QueryInterface(IID_ICompositorInterop, &compInterop)) && compInterop) {
@@ -712,6 +811,76 @@ void CubeRenderer::InitializeGraphicsDevice() {
     }
 }
 
+// Module 3B: Hardware GPU Gaussian Blur Background
+void CubeRenderer::BuildBackgroundBlurredSurface(const DesktopCaptureManager::SnapshotData& snapshot) {
+    if (!m_compGraphicsDevice || snapshot.pixels.empty()) return;
+
+    void** gdVtbl = *(void***)m_compGraphicsDevice;
+    typedef HRESULT(STDMETHODCALLTYPE* CreateDrawingSurfaceFn)(void*, SIZE, int, int, void**);
+    CreateDrawingSurfaceFn fnCreateSurface = (CreateDrawingSurfaceFn)gdVtbl[3];
+
+    SIZE surfaceSize{ (LONG)m_screenWidth, (LONG)m_screenHeight };
+    void* pDrawingSurface = nullptr;
+    HRESULT hr = fnCreateSurface(m_compGraphicsDevice, surfaceSize, 87 /* DXGI_FORMAT_B8G8R8A8_UNORM */, 1 /* Premultiplied */, &pDrawingSurface);
+    if (SUCCEEDED(hr) && pDrawingSurface) {
+        winrt::copy_from_abi(m_bgSurface, pDrawingSurface);
+
+        ICompositionDrawingSurfaceInterop* surfaceInterop = nullptr;
+        if (SUCCEEDED(((IUnknown*)pDrawingSurface)->QueryInterface(IID_ICompositionDrawingSurfaceInterop, (void**)&surfaceInterop)) && surfaceInterop) {
+            ID2D1DeviceContext* d2dContext = nullptr;
+            POINT offset{};
+            if (SUCCEEDED(surfaceInterop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), (void**)&d2dContext, &offset)) && d2dContext) {
+                d2dContext->Clear(D2D1::ColorF(0.04f, 0.05f, 0.08f, 1.0f));
+
+                D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                ID2D1Bitmap* pBitmap = nullptr;
+                hr = d2dContext->CreateBitmap(
+                    D2D1::SizeU(snapshot.width, snapshot.height),
+                    snapshot.pixels.data(),
+                    snapshot.width * sizeof(uint32_t),
+                    props,
+                    &pBitmap
+                );
+
+                if (SUCCEEDED(hr) && pBitmap) {
+                    if (g_settings.backgroundBlur) {
+                        ID2D1Effect* pBlurEffect = nullptr;
+                        hr = d2dContext->CreateEffect(CLSID_D2D1GaussianBlur, &pBlurEffect);
+                        if (SUCCEEDED(hr) && pBlurEffect) {
+                            pBlurEffect->SetInput(0, pBitmap);
+                            pBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, 28.0f);
+                            pBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, (UINT32)0 /* SPEED */);
+                            pBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
+
+                            d2dContext->DrawImage(pBlurEffect, D2D1::Point2F((float)offset.x, (float)offset.y));
+                            pBlurEffect->Release();
+                        } else {
+                            D2D1_RECT_F destRect = D2D1::RectF((float)offset.x, (float)offset.y, (float)offset.x + m_screenWidth, (float)offset.y + m_screenHeight);
+                            d2dContext->DrawBitmap(pBitmap, destRect);
+                        }
+                    } else {
+                        D2D1_RECT_F destRect = D2D1::RectF((float)offset.x, (float)offset.y, (float)offset.x + m_screenWidth, (float)offset.y + m_screenHeight);
+                        d2dContext->DrawBitmap(pBitmap, destRect);
+                    }
+                    pBitmap->Release();
+                }
+
+                surfaceInterop->EndDraw();
+                d2dContext->Release();
+            }
+            surfaceInterop->Release();
+        }
+        ((IUnknown*)pDrawingSurface)->Release();
+
+        m_backgroundVisual = m_compositor.CreateSpriteVisual();
+        m_backgroundVisual.Size({ m_screenWidth, m_screenHeight });
+        m_backgroundVisual.Brush(m_compositor.CreateSurfaceBrush(m_bgSurface));
+        m_rootVisual.Children().InsertAtBottom(m_backgroundVisual);
+    }
+}
+
+// Module 3C: Genuine Desktop Faces (Real Screenshots or Authentic Live Window Cards)
 void CubeRenderer::BuildFaceSurfaces() {
     if (!m_compGraphicsDevice) return;
 
@@ -752,16 +921,12 @@ void CubeRenderer::BuildFaceSurfaces() {
                 ID2D1DeviceContext* d2dContext = nullptr;
                 POINT offset{};
                 if (SUCCEEDED(surfaceInterop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext), (void**)&d2dContext, &offset)) && d2dContext) {
-                    d2dContext->Clear(D2D1::ColorF(D2D1::ColorF(0.08f, 0.10f, 0.15f, 1.0f)));
+                    d2dContext->Clear(D2D1::ColorF(0.07f, 0.09f, 0.13f, 1.0f));
 
-                    // Retrieve real captured snapshot
                     const GUID& dId = m_desktopList.items[dIdx].id;
                     const auto* snapshot = DesktopCaptureManager::GetSnapshot(dId);
-                    if (!snapshot || snapshot->pixels.empty()) {
-                        if (curIdx >= 0 && curIdx < total) {
-                            snapshot = DesktopCaptureManager::GetSnapshot(m_desktopList.items[curIdx].id);
-                        }
-                    }
+
+                    // CASE 1: Visited desktop with actual captured full-screen snapshot
                     if (snapshot && !snapshot->pixels.empty()) {
                         D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
                             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
@@ -775,14 +940,71 @@ void CubeRenderer::BuildFaceSurfaces() {
                         );
                         if (SUCCEEDED(hr) && pBitmap) {
                             D2D1_RECT_F destRect = D2D1::RectF(
-                                (float)offset.x,
-                                (float)offset.y,
-                                (float)offset.x + m_faceWidth,
-                                (float)offset.y + m_faceHeight
+                                (float)offset.x, (float)offset.y,
+                                (float)offset.x + m_faceWidth, (float)offset.y + m_faceHeight
                             );
                             d2dContext->DrawBitmap(pBitmap, destRect);
                             pBitmap->Release();
                         }
+                    }
+                    // CASE 2: Inactive desktop without a full snapshot yet:
+                    // Render authentic window cards & genuine desktop identity (NEVER duplicate desktop 1)
+                    else {
+                        std::vector<VDManager::WindowCard> cards;
+                        VDManager::GetWindowsForDesktop(dId, cards);
+
+                        ID2D1SolidColorBrush* pCardBrush = nullptr;
+                        ID2D1SolidColorBrush* pBorderBrush = nullptr;
+                        ID2D1SolidColorBrush* pTextBrush = nullptr;
+                        d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.12f, 0.15f, 0.22f, 0.90f), &pCardBrush);
+                        d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.20f, 0.26f, 0.36f, 1.0f), &pBorderBrush);
+                        d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.92f, 0.94f, 0.98f, 1.0f), &pTextBrush);
+
+                        if (!cards.empty()) {
+                            float scaleX = m_faceWidth / m_screenWidth;
+                            float scaleY = m_faceHeight / m_screenHeight;
+
+                            for (const auto& card : cards) {
+                                float left = (float)offset.x + (float)card.rect.left * scaleX;
+                                float top = (float)offset.y + (float)card.rect.top * scaleY;
+                                float right = (float)offset.x + (float)card.rect.right * scaleX;
+                                float bottom = (float)offset.y + (float)card.rect.bottom * scaleY;
+
+                                if (right > left + 30.0f && bottom > top + 20.0f) {
+                                    D2D1_ROUNDED_RECT rrect = D2D1::RoundedRect(D2D1::RectF(left, top, right, bottom), 4.0f, 4.0f);
+                                    if (pCardBrush) d2dContext->FillRoundedRectangle(rrect, pCardBrush);
+                                    if (pBorderBrush) d2dContext->DrawRoundedRectangle(rrect, pBorderBrush, 1.0f);
+
+                                    // Window title
+                                    if (m_textFormatTitle && pTextBrush) {
+                                        D2D1_RECT_F textRect = D2D1::RectF(left + 6.0f, top + 4.0f, right - 6.0f, top + 20.0f);
+                                        d2dContext->DrawText(
+                                            card.title.c_str(), (UINT32)card.title.length(),
+                                            m_textFormatTitle, textRect, pTextBrush
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            // Authentic Empty Workspace state
+                            if (m_textFormatBadge && pTextBrush) {
+                                wchar_t szEmpty[64];
+                                swprintf_s(szEmpty, L"Desktop %d\n(Empty Workspace)", dIdx + 1);
+                                D2D1_RECT_F emptyRect = D2D1::RectF(
+                                    (float)offset.x, (float)offset.y + m_faceHeight * 0.40f,
+                                    (float)offset.x + m_faceWidth, (float)offset.y + m_faceHeight * 0.60f
+                                );
+                                d2dContext->DrawText(
+                                    szEmpty, (UINT32)wcslen(szEmpty),
+                                    m_textFormatBadge, emptyRect, pTextBrush,
+                                    D2D1_DRAW_TEXT_OPTIONS_NONE
+                                );
+                            }
+                        }
+
+                        if (pCardBrush) pCardBrush->Release();
+                        if (pBorderBrush) pBorderBrush->Release();
+                        if (pTextBrush) pTextBrush->Release();
                     }
 
                     surfaceInterop->EndDraw();
@@ -814,10 +1036,14 @@ bool CubeRenderer::Create(HWND hTaskbarWnd, POINT anchorPoint) {
     UpdateDimensions(monW, monH);
 
     // 1. Query Real Virtual Desktops
-    VirtualDesktopManager::QueryDesktops(m_desktopList);
+    VDManager::QueryDesktops(m_desktopList);
 
-    // 2. Refresh active desktop screen snapshot (~3ms)
-    DesktopCaptureManager::AcquireSnapshots(m_desktopList, m_monitorRect);
+    // 2. Pre-capture active desktop screen BEFORE creating/showing overlay window (zero recursion)
+    DesktopCaptureManager::SnapshotData currentSnapshot;
+    DesktopCaptureManager::CaptureMonitorScreen(m_monitorRect, currentSnapshot);
+    if (!currentSnapshot.pixels.empty() && m_desktopList.currentIndex >= 0 && m_desktopList.currentIndex < m_desktopList.TotalCount()) {
+        DesktopCaptureManager::StoreSnapshot(m_desktopList.items[m_desktopList.currentIndex].id, currentSnapshot);
+    }
 
     // Register overlay class
     static bool s_classRegistered = false;
@@ -832,9 +1058,10 @@ bool CubeRenderer::Create(HWND hTaskbarWnd, POINT anchorPoint) {
         s_classRegistered = true;
     }
 
-    // Create transparent topmost overlay window (NOACTIVATE preserves Explorer focus)
+    // Create transparent topmost overlay window.
+    // WS_EX_TRANSPARENT ensures the overlay does NOT trap mouse hit testing or cause feedback loops with taskbar.
     m_hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT,
         s_className,
         L"Compiz Desktop Cube",
         WS_POPUP,
@@ -847,45 +1074,18 @@ bool CubeRenderer::Create(HWND hTaskbarWnd, POINT anchorPoint) {
         return false;
     }
 
-    // 1. Extend DWM frame into client area
-    MARGINS margins = { -1, -1, -1, -1 };
-    DwmExtendFrameIntoClientArea(m_hwnd, &margins);
-
-    // 2. Hardware-accelerated Windows 11 Desktop Acrylic backdrop
-    if (g_settings.backgroundBlur) {
-        int backdrop = 3; // DWMSBT_TRANSIENTWINDOW (Desktop Acrylic blur of live desktop)
-        DwmSetWindowAttribute(m_hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
-    }
-
-    // 3. Fallback Accent Policy for Acrylic blur
-    typedef BOOL(WINAPI* pSetWindowCompositionAttribute)(HWND, void*);
-    auto pfnSetWindowCompositionAttribute = (pSetWindowCompositionAttribute)GetProcAddress(
-        GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
-    if (pfnSetWindowCompositionAttribute) {
-        struct ACCENT_POLICY {
-            INT AccentState;
-            INT AccentFlags;
-            INT GradientColor;
-            INT AnimationId;
-        };
-        struct WINCOMPATTRDATA {
-            DWORD Attrib;
-            PVOID pvData;
-            SIZE_T cbData;
-        };
-        ACCENT_POLICY accentPolicy{};
-        accentPolicy.AccentState = g_settings.backgroundBlur ? 4 /* ACCENT_STATE_ENABLE_ACRYLICBLURBEHIND */ : 2;
-        accentPolicy.AccentFlags = (1 << 2); // ACCENT_FLAG_ENABLE_FULLSCREEN
-        accentPolicy.GradientColor = 0x2210121A; // Translucent dark tint (~13% opacity)
-
-        WINCOMPATTRDATA winCompAttrData{ 19, &accentPolicy, sizeof(accentPolicy) };
-        pfnSetWindowCompositionAttribute(m_hwnd, &winCompAttrData);
-    }
-
     try {
         m_compositor = Compositor();
-        auto interop = m_compositor.as<ICompositorDesktopInterop>();
-        HRESULT hr = interop->CreateDesktopWindowTarget(m_hwnd, TRUE, winrt::put_abi(m_target));
+        IUnknown* compUnk = (IUnknown*)winrt::get_abi(m_compositor);
+        ICompositorDesktopInterop* interop = nullptr;
+        HRESULT hr = compUnk->QueryInterface(IID_ICompositorDesktopInterop, (void**)&interop);
+        if (FAILED(hr) || !interop) {
+            Destroy();
+            return false;
+        }
+
+        hr = interop->CreateDesktopWindowTarget(m_hwnd, TRUE, winrt::put_abi(m_target));
+        interop->Release();
         if (FAILED(hr) || !m_target) {
             Destroy();
             return false;
@@ -894,14 +1094,20 @@ bool CubeRenderer::Create(HWND hTaskbarWnd, POINT anchorPoint) {
         m_rootVisual = m_compositor.CreateContainerVisual();
         m_rootVisual.Size({ m_screenWidth, m_screenHeight });
 
-        // Subtle dark scrim over blurred desktop (translucent so live desktop visibly shines through)
+        // Initialize DirectX, Direct2D, and DirectWrite
+        InitializeGraphicsDevice();
+
+        // 3. Build Hardware GPU Gaussian Blur Background
+        BuildBackgroundBlurredSurface(currentSnapshot);
+
+        // 4. Scrim Dimming layer over blurred background
         m_scrimVisual = m_compositor.CreateSpriteVisual();
         m_scrimVisual.Size({ m_screenWidth, m_screenHeight });
-        uint8_t scrimAlpha = (uint8_t)((g_settings.backgroundDim * 70) / 100);
-        m_scrimVisual.Brush(m_compositor.CreateColorBrush({ scrimAlpha, 10, 12, 18 }));
+        uint8_t scrimAlpha = (uint8_t)((g_settings.backgroundDim * 255) / 100);
+        m_scrimVisual.Brush(m_compositor.CreateColorBrush({ scrimAlpha, 8, 10, 16 }));
         m_rootVisual.Children().InsertAtTop(m_scrimVisual);
 
-        // 3D Cube Container
+        // 5. 3D Cube Container
         m_cubeContainer = m_compositor.CreateContainerVisual();
         m_cubeContainer.Size({ m_screenWidth, m_screenHeight });
         m_rootVisual.Children().InsertAtTop(m_cubeContainer);
@@ -921,10 +1127,10 @@ bool CubeRenderer::Create(HWND hTaskbarWnd, POINT anchorPoint) {
             f.container = m_compositor.CreateContainerVisual();
             f.container.Size({ m_faceWidth, m_faceHeight });
 
-            // Face background snapshot visual
+            // Face background visual
             f.background = m_compositor.CreateSpriteVisual();
             f.background.Size({ m_faceWidth, m_faceHeight });
-            f.background.Brush(m_compositor.CreateColorBrush({ 220, 20, 24, 32 })); // Fallback base
+            f.background.Brush(m_compositor.CreateColorBrush({ 220, 20, 24, 32 }));
             f.container.Children().InsertAtBottom(f.background);
 
             // Top accent bar (3px)
@@ -978,15 +1184,14 @@ bool CubeRenderer::Create(HWND hTaskbarWnd, POINT anchorPoint) {
             m_cubeContainer.Children().InsertAtTop(f.container);
         }
 
-        // Initialize Direct2D device & upload real captured desktop textures
-        InitializeGraphicsDevice();
+        // Upload real captured desktop textures & authentic window cards
         BuildFaceSurfaces();
 
         m_target.Root(m_rootVisual);
         UpdateCubeFaceTransforms(0.0f);
 
         ShowWindow(m_hwnd, SW_SHOWNA);
-        LOG_INF(L"Cube overlay presented with real desktop snapshots");
+        LOG_INF(L"Cube overlay presented with real desktop content and blurred background");
         return true;
     } catch (...) {
         Destroy();
@@ -1011,6 +1216,8 @@ void CubeRenderer::Destroy() {
 
     m_target = nullptr;
     m_rootVisual = nullptr;
+    m_backgroundVisual = nullptr;
+    m_bgSurface = nullptr;
     m_scrimVisual = nullptr;
     m_cubeContainer = nullptr;
 
@@ -1021,6 +1228,19 @@ void CubeRenderer::Destroy() {
         m_faces[i].headerPill = nullptr;
         m_faces[i].surface = nullptr;
         m_faces[i].surfaceBrush = nullptr;
+    }
+
+    if (m_textFormatBadge) {
+        m_textFormatBadge->Release();
+        m_textFormatBadge = nullptr;
+    }
+    if (m_textFormatTitle) {
+        m_textFormatTitle->Release();
+        m_textFormatTitle = nullptr;
+    }
+    if (m_dwriteFactory) {
+        m_dwriteFactory->Release();
+        m_dwriteFactory = nullptr;
     }
 
     if (m_compGraphicsDevice) {
@@ -1105,7 +1325,6 @@ void CubeRenderer::SnapToAngle(float targetAngleDegrees, int snapDesktopOffset) 
     m_snapAnim.endAngle = targetAngleDegrees;
     m_snapAnim.snapOffset = snapDesktopOffset;
 
-    // Dynamic fluid animation duration based on snap distance
     float deltaDeg = std::abs(targetAngleDegrees - m_currentRotation);
     int dynamicDuration = (int)(70.0f + 2.0f * deltaDeg);
     if (dynamicDuration < 60) dynamicDuration = 60;
@@ -1145,7 +1364,7 @@ void CubeRenderer::OnAnimationTick() {
             int total = m_desktopList.TotalCount();
             if (total > 0 && m_snapAnim.snapOffset != 0) {
                 int targetIndex = ((m_desktopList.currentIndex + m_snapAnim.snapOffset) % total + total) % total;
-                VirtualDesktopManager::SwitchToDesktopByIndex(targetIndex);
+                VDManager::SwitchToDesktopByIndex(targetIndex);
             }
             return;
         }
@@ -1184,9 +1403,13 @@ namespace GestureController {
     static HWND s_anchorTaskbar = nullptr;
 
     static HHOOK s_hKeyboardHook = nullptr;
+    static HHOOK s_hMouseHook = nullptr;
     static com_ptr<IUIAutomation> s_pUIAutomation;
     static UINT_PTR s_armingTimerId = 0;
     static constexpr UINT_PTR TIMER_ARMING_CHECK = 1002;
+
+    void OnActiveMouseUp(POINT pt);
+    void OnActiveMouseMove(POINT pt);
 
     GestureState GetState() {
         return s_state.load();
@@ -1211,7 +1434,6 @@ namespace GestureController {
         HWND hCheck = hTarget ? hTarget : hWndOrigin;
         if (!hCheck) return false;
 
-        // 1. Verify that window belongs to the taskbar window hierarchy
         bool isTaskbar = false;
         HWND cur = hCheck;
         while (cur) {
@@ -1254,7 +1476,7 @@ namespace GestureController {
         HWND hRoot = GetAncestor(hCheck, GA_ROOT);
         HWND hTaskbar = hRoot ? hRoot : hCheck;
 
-        // 2. Reject TrayNotifyWnd (clock, system tray, notification center)
+        // Reject TrayNotifyWnd (clock, system tray, notification center)
         HWND hTrayNotify = FindWindowExW(hTaskbar, nullptr, L"TrayNotifyWnd", nullptr);
         if (hTrayNotify && IsWindowVisible(hTrayNotify)) {
             RECT rcTray{};
@@ -1265,7 +1487,7 @@ namespace GestureController {
             }
         }
 
-        // 3. Reject classic Start button if separate window
+        // Reject Start button
         HWND hStart = FindWindowExW(hTaskbar, nullptr, L"Start", nullptr);
         if (hStart && IsWindowVisible(hStart)) {
             RECT rcStart{};
@@ -1276,14 +1498,14 @@ namespace GestureController {
             }
         }
 
-        // 4. Reject active context menus or popups
+        // Reject active context menus
         HWND hMenu = FindWindowW(L"#32768", nullptr);
         if (hMenu && IsWindowVisible(hMenu)) {
             LOG_DBG(L"Taskbar hit rejected: context menu is open");
             return false;
         }
 
-        // 5. Modern XAML Island Button / Control Filtering via UIAutomation
+        // Modern XAML Island Button / Control Filtering via UIAutomation
         if (InitUIAutomation()) {
             com_ptr<IUIAutomationElement> element;
             if (SUCCEEDED(s_pUIAutomation->ElementFromPoint(pt, element.put())) && element) {
@@ -1292,7 +1514,6 @@ namespace GestureController {
                 std::wstring className = bstrClass ? bstrClass : L"";
                 if (bstrClass) SysFreeString(bstrClass);
 
-                // Reject buttons & interactive controls
                 if (className == L"Taskbar.TaskListButtonAutomationPeer" ||
                     className == L"Taskbar.SearchBoxButtonAutomationPeer" ||
                     className == L"Taskbar.TaskViewButtonAutomationPeer" ||
@@ -1313,6 +1534,8 @@ namespace GestureController {
 
     static void InstallKeyboardHook();
     static void RemoveKeyboardHook();
+    static void InstallMouseHook();
+    static void RemoveMouseHook();
 
     static void CancelArming() {
         if (s_state.load() == GestureState::Arming) {
@@ -1334,11 +1557,11 @@ namespace GestureController {
         }
         s_armingTimerId = 0;
 
-        s_state.store(GestureState::Active);
+        s_state.store(GestureState::ActiveDrag);
         s_prevMousePoint = pt;
         s_currentAngle = 0.0f;
 
-        LOG_INF(L"ARMING -> ACTIVE at (%ld, %ld)", pt.x, pt.y);
+        LOG_INF(L"ARMING -> ACTIVE_DRAG at (%ld, %ld)", pt.x, pt.y);
 
         if (!CubeRenderer::Instance().Create(s_anchorTaskbar, s_startPoint)) {
             LOG_ERR(L"Failed to create CubeRenderer window");
@@ -1347,22 +1570,17 @@ namespace GestureController {
             return;
         }
 
-        HWND hOverlay = CubeRenderer::Instance().GetHwnd();
-        HWND hPrevCap = SetCapture(hOverlay);
-        if (GetCapture() != hOverlay) {
-            LOG_ERR(L"SetCapture FAILED error=%lu", GetLastError());
-        } else {
-            LOG_INF(L"SetCapture hwnd=0x%p result=0x%p", hOverlay, hPrevCap);
-        }
+        // Install global low-level mouse tracking hook.
+        // This tracks the cursor globally across all monitors and windows without deactivating when leaving the taskbar!
+        InstallMouseHook();
     }
 
-    // Called on left mouse down on taskbar
     bool OnMouseDown(HWND hWnd, POINT pt) {
         if (s_state.load() != GestureState::Idle || CubeRenderer::Instance().IsActive()) {
             return false;
         }
 
-        LOG_DBG(L"Gesture Begin candidate x=%ld y=%ld hwnd=0x%p", pt.x, pt.y, hWnd);
+        LOG_DBG(L"Gesture candidate at (%ld, %ld) hWnd=0x%p", pt.x, pt.y, hWnd);
 
         if (IsEmptyTaskbarSpace(hWnd, pt)) {
             s_state.store(GestureState::Arming);
@@ -1370,7 +1588,6 @@ namespace GestureController {
             s_prevMousePoint = pt;
             s_anchorTaskbar = hWnd;
 
-            // Start arming tracker timer on taskbar window (~8ms)
             s_armingTimerId = SetTimer(hWnd, TIMER_ARMING_CHECK, 8, nullptr);
             InstallKeyboardHook();
 
@@ -1381,22 +1598,18 @@ namespace GestureController {
         return false;
     }
 
-    // Evaluates inward movement distance relative to taskbar position
     static int GetInwardDragDistance(POINT pt) {
         RECT rcBar{};
         if (s_anchorTaskbar && IsWindow(s_anchorTaskbar)) {
             GetWindowRect(s_anchorTaskbar, &rcBar);
         }
         if (rcBar.top > 100) {
-            // Taskbar is at the bottom: dragging upward into screen is positive
-            return s_startPoint.y - pt.y;
+            return s_startPoint.y - pt.y; // taskbar at bottom: upward drag into screen
         } else {
-            // Taskbar is at the top: dragging downward into screen is positive
-            return pt.y - s_startPoint.y;
+            return pt.y - s_startPoint.y; // taskbar at top: downward drag into screen
         }
     }
 
-    // Called during Arming movement
     void OnArmingMouseMove(POINT pt) {
         if (s_state.load() != GestureState::Arming) return;
 
@@ -1411,7 +1624,6 @@ namespace GestureController {
         }
     }
 
-    // Arming timer tick: catches upward movement even if cursor leaves taskbar without mousemove
     void OnArmingTimerTick() {
         if (s_state.load() != GestureState::Arming) {
             if (s_anchorTaskbar && IsWindow(s_anchorTaskbar)) {
@@ -1439,9 +1651,15 @@ namespace GestureController {
         }
     }
 
-    // Authoritative Active mouse movement (called exclusively through SetCapture in CubeRenderer::WndProc)
+    // Active mouse movement: continuous 360 rotation driven by low-level mouse hook
     void OnActiveMouseMove(POINT pt) {
-        if (s_state.load() != GestureState::Active) return;
+        if (s_state.load() != GestureState::ActiveDrag) return;
+
+        // Safety check: if left button was released without clean event
+        if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+            OnActiveMouseUp(pt);
+            return;
+        }
 
         int deltaX = pt.x - s_prevMousePoint.x;
         s_prevMousePoint = pt;
@@ -1450,64 +1668,90 @@ namespace GestureController {
             s_currentAngle += (float)deltaX * g_settings.horizontalSensitivity;
             CubeRenderer::Instance().SetRotationAngle(s_currentAngle);
         }
-
-        static auto s_lastLogTime = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastLogTime).count() > 80) {
-            LOG_DBG(L"MOVE x=%ld dx=%d angle=%.2f", pt.x, deltaX, s_currentAngle);
-            s_lastLogTime = now;
-        }
     }
 
-    // Authoritative Mouse Release (called exclusively through SetCapture in CubeRenderer::WndProc)
+    // Active mouse release: commits snap to target desktop
     void OnActiveMouseUp(POINT pt) {
-        if (s_state.load() != GestureState::Active) return;
+        if (s_state.load() != GestureState::ActiveDrag) return;
 
-        LOG_INF(L"LBUTTONUP angle=%.2f", s_currentAngle);
-        s_state.store(GestureState::Snapping);
+        LOG_INF(L"ACTIVE_DRAG -> COMMITTING angle=%.2f", s_currentAngle);
+        s_state.store(GestureState::Committing);
+        RemoveMouseHook();
         RemoveKeyboardHook();
 
-        int snapOffset = (int)std::round(s_currentAngle / 90.0f);
-        float targetAngle = (float)snapOffset * 90.0f;
-        LOG_INF(L"SNAP offset=%d targetAngle=%.2f", snapOffset, targetAngle);
+        // Snap-back threshold: if drag was minimal (< 15 degrees), return to original desktop
+        int snapOffset = 0;
+        float targetAngle = 0.0f;
+        if (std::abs(s_currentAngle) >= 15.0f) {
+            snapOffset = (int)std::round(s_currentAngle / 90.0f);
+            targetAngle = (float)snapOffset * 90.0f;
+        }
 
+        LOG_INF(L"Snap target: offset=%d targetAngle=%.2f", snapOffset, targetAngle);
         CubeRenderer::Instance().SnapToAngle(targetAngle, snapOffset);
     }
 
     void OnSnapCompleted() {
         s_state.store(GestureState::Idle);
-        LOG_INF(L"Snap animation completed -> IDLE");
+        LOG_INF(L"COMMITTING completed -> IDLE");
     }
 
     void OnCancel() {
         GestureState st = s_state.load();
         if (st == GestureState::Arming) {
             CancelArming();
-        } else if (st == GestureState::Active) {
+        } else if (st == GestureState::ActiveDrag) {
             LOG_INF(L"Escape pressed: cancelling active cube gesture");
-            ReleaseCapture();
-            LOG_DBG(L"ReleaseCapture");
-            s_state.store(GestureState::Snapping);
+            s_state.store(GestureState::Committing);
+            RemoveMouseHook();
             RemoveKeyboardHook();
             CubeRenderer::Instance().Cancel();
         }
     }
 
-    void OnCaptureLost() {
-        if (s_state.load() == GestureState::Active) {
-            LOG_INF(L"Mouse capture lost externally: returning cube to current desktop");
-            s_state.store(GestureState::Snapping);
-            RemoveKeyboardHook();
-            CubeRenderer::Instance().Cancel();
+    // Low-Level Mouse Hook Proc: globally tracks cursor across desktop, windows, and monitors
+    static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+        if (nCode == HC_ACTION && s_state.load() == GestureState::ActiveDrag) {
+            MSLLHOOKSTRUCT* pMouse = (MSLLHOOKSTRUCT*)lParam;
+            if (pMouse) {
+                if (wParam == WM_MOUSEMOVE) {
+                    OnActiveMouseMove(pMouse->pt);
+                } else if (wParam == WM_LBUTTONUP) {
+                    OnActiveMouseUp(pMouse->pt);
+                    return 1; // Consume mouse up so underlying window/desktop is not clicked
+                }
+            }
+        }
+        return CallNextHookEx(s_hMouseHook, nCode, wParam, lParam);
+    }
+
+    static void InstallMouseHook() {
+        if (!s_hMouseHook) {
+            HMODULE hMod = nullptr;
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCWSTR)&LowLevelMouseProc,
+                &hMod
+            );
+            s_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hMod, 0);
+            LOG_DBG(L"Installed WH_MOUSE_LL hook (0x%p)", s_hMouseHook);
         }
     }
 
-    // Low-level keyboard hook: ONLY listens for VK_ESCAPE to guarantee instant cancellation
+    static void RemoveMouseHook() {
+        if (s_hMouseHook) {
+            UnhookWindowsHookEx(s_hMouseHook);
+            s_hMouseHook = nullptr;
+            LOG_DBG(L"Removed WH_MOUSE_LL hook");
+        }
+    }
+
+    // Low-Level Keyboard Hook: listens for Escape to cancel immediately
     static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
             KBDLLHOOKSTRUCT* pKb = (KBDLLHOOKSTRUCT*)lParam;
             if (pKb && pKb->vkCode == VK_ESCAPE) {
-                if (s_state.load() == GestureState::Active || s_state.load() == GestureState::Arming) {
+                if (s_state.load() == GestureState::ActiveDrag || s_state.load() == GestureState::Arming) {
                     OnCancel();
                     return 1; // Swallowed
                 }
@@ -1538,35 +1782,15 @@ namespace GestureController {
 } // namespace GestureController
 
 // ============================================================================
-// CubeRenderer Window Procedure (Receives SetCapture Input Exclusively)
+// CubeRenderer Window Procedure
 // ============================================================================
 LRESULT CALLBACK CubeRenderer::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_MOUSEMOVE: {
-            POINT pt;
-            GetCursorPos(&pt);
-            GestureController::OnActiveMouseMove(pt);
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            // DO NOT cancel the gesture on capture changes!
+            // Global mouse tracking is managed by WH_MOUSE_LL so moving off the taskbar never terminates the cube.
             return 0;
-        }
-
-        case WM_LBUTTONUP: {
-            POINT pt;
-            GetCursorPos(&pt);
-            ReleaseCapture();
-            LOG_DBG(L"ReleaseCapture");
-            GestureController::OnActiveMouseUp(pt);
-            return 0;
-        }
-
-        case WM_CAPTURECHANGED: {
-            GestureController::OnCaptureLost();
-            return 0;
-        }
-
-        case WM_CANCELMODE: {
-            GestureController::OnCancel();
-            return 0;
-        }
 
         case WM_KEYDOWN: {
             if (wParam == VK_ESCAPE) {
@@ -1755,7 +1979,6 @@ static void SubclassTaskbar(HWND hWnd) {
         }
     }
 
-    // Recursively discover and hook any Windows.UI.Input.InputSite.WindowClass child windows
     EnumChildWindows(hWnd, EnumChildFindInputSite, 0);
 }
 
